@@ -30,6 +30,17 @@ namespace plugins
 //!
 //! This plugin implements efficient attention mechanisms including context attention (prefill)
 //! and decode attention with KV cache support.
+//!
+//! ## Python/Torch-TensorRT Compatibility Mode
+//!
+//! When `enableDeltaKVOutput` is set to 1, the plugin outputs only the newly computed/updated
+//! portion of the KV cache (delta) instead of the full KV cache. This is required for Python
+//! and torch_tensorrt integration where in-place buffer updates cannot be retrieved directly.
+//!
+//! - **Context Phase**: Output KV has shape [B, 2, H, SeqLen, D] (all processed tokens)
+//! - **Generation Phase**: Output KV has shape [B, 2, H, 1, D] (only the new token)
+//!
+//! The Python runtime must explicitly merge this delta into the main KV cache buffer.
 class AttentionPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
@@ -39,8 +50,9 @@ public:
     //! \param[in] numKVHeads Number of key-value heads
     //! \param[in] headSize Head dimension size
     //! \param[in] supportsSpecDecode Whether to support speculative decoding (Tree attention)
-    AttentionPlugin(
-        std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t supportsSpecDecode);
+    //! \param[in] enableDeltaKVOutput Whether to output delta KV only (for Python/torch_tensorrt compatibility)
+    AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+        int32_t supportsSpecDecode, int32_t enableDeltaKVOutput = 0);
 
     //! \brief Constructor for deserialization
     //! \param[in] name Plugin instance name
@@ -168,6 +180,10 @@ protected:
     int32_t mHeadSize{};
     //! Whether to enable tree attention for EAGLE speculative decoding
     int32_t mEnableTreeAttention{};
+    //! Whether to output only delta KV cache (for Python/torch_tensorrt compatibility)
+    //! When enabled, output KV has shape [B, 2, H, SeqLen, D] for context phase
+    //! and [B, 2, H, 1, D] for generation phase
+    int32_t mEnableDeltaKVOutput{};
 
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};

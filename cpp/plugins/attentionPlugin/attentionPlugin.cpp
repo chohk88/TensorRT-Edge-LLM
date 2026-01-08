@@ -28,6 +28,8 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -43,6 +45,40 @@ namespace
 {
 constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
+
+// Debug logging control via environment variable
+bool isDebugEnabled()
+{
+    static bool initialized = false;
+    static bool debugEnabled = false;
+
+    if (!initialized)
+    {
+        char const* envVar = std::getenv("TRT_EDGELLM_DEBUG_PLUGIN");
+        debugEnabled = (envVar != nullptr && (std::string(envVar) == "1" || std::string(envVar) == "true"));
+        initialized = true;
+
+        if (debugEnabled)
+        {
+            std::printf("[AttentionPlugin] Debug logging enabled via TRT_EDGELLM_DEBUG_PLUGIN\n");
+        }
+    }
+
+    return debugEnabled;
+}
+
+// Helper macros for debug logging
+#define PLUGIN_DEBUG_LOG(...)                                                                                          \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (isDebugEnabled())                                                                                          \
+        {                                                                                                              \
+            std::printf("[AttentionPlugin][%s:%d] ", __FUNCTION__, __LINE__);                                          \
+            std::printf(__VA_ARGS__);                                                                                  \
+            std::printf("\n");                                                                                         \
+            std::fflush(stdout);                                                                                       \
+        }                                                                                                              \
+    } while (0)
 
 // Workaround for CUDA12/13 Thor re-numbering. The kernels themselves have version compatibility.
 void applyThorSMRenumberWAR(int32_t& smVersion)
@@ -141,13 +177,14 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
-AttentionPlugin::AttentionPlugin(
-    std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t enableTreeAttention)
+AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+    int32_t enableTreeAttention, int32_t enableDeltaKVOutput)
     : mLayerName(name)
     , mNumQHeads(numQHeads)
     , mNumKVHeads(numKVHeads)
     , mHeadSize(headSize)
     , mEnableTreeAttention(enableTreeAttention)
+    , mEnableDeltaKVOutput(enableDeltaKVOutput)
 {
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -180,6 +217,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
     deserializeValue(&data, &length, &mNumKVHeads);
     deserializeValue(&data, &length, &mHeadSize);
     deserializeValue(&data, &length, &mEnableTreeAttention);
+    deserializeValue(&data, &length, &mEnableDeltaKVOutput);
 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -194,7 +232,8 @@ AttentionPlugin::~AttentionPlugin() {}
 
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention);
+    AttentionPlugin* plugin
+        = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention, mEnableDeltaKVOutput);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -386,12 +425,24 @@ DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::Di
     }
     else if (outputIndex == kOUT_KV_CACHE_IDX)
     {
-        // Output[1] is KVCache, same shape as input KV cache
         output.nbDims = 5;
         output.d[0] = inputs[1].d[0];
         output.d[1] = inputs[1].d[1];
         output.d[2] = inputs[1].d[2];
-        output.d[3] = inputs[1].d[3];
+
+        if (mEnableDeltaKVOutput)
+        {
+            // Delta KV Output mode: output only the newly computed/updated portion
+            // Shape is [B, 2, H, SeqLen, D] where SeqLen comes from input QKV tensor
+            // For Context phase: SeqLen = input sequence length
+            // For Generation phase: SeqLen = 1 (single token)
+            output.d[3] = inputs[0].d[1]; // Use runtimeSeqLen from QKV input
+        }
+        else
+        {
+            // Standard mode: output full KV cache (same shape as input)
+            output.d[3] = inputs[1].d[3];
+        }
         output.d[4] = inputs[1].d[4];
     }
     return output;
@@ -489,8 +540,27 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     // Construct the KVCache tensor from the input KV cache descriptor.
     // This allows KV cache from 0 to maxSeqLen and helps adjust the profile at runtime.
     PluginTensorDesc const& kvCacheInputDesc = inputDesc[kIN_KV_CACHE_IDX];
-    rt::Tensor kvCacheTensor(
-        outputs[kOUT_KV_CACHE_IDX], rt::Coords{kvCacheInputDesc.dims}, rt::DeviceType::kGPU, kvCacheInputDesc.type);
+
+    // For Delta KV Output mode, we need to use the input KV cache for kernel computation
+    // (in-place update), then copy the delta to the output.
+    // For standard mode, we directly use the output buffer as the KV cache tensor.
+    half* kvCacheInputPtr = reinterpret_cast<half*>(const_cast<void*>(inputs[kIN_KV_CACHE_IDX]));
+    half* kvCacheOutputPtr = reinterpret_cast<half*>(outputs[kOUT_KV_CACHE_IDX]);
+
+    rt::Tensor kvCacheTensor;
+    if (mEnableDeltaKVOutput)
+    {
+        // Use input KV cache for kernel operations (kernels will update in-place)
+        kvCacheTensor = rt::Tensor(
+            kvCacheInputPtr, rt::Coords{kvCacheInputDesc.dims}, rt::DeviceType::kGPU, kvCacheInputDesc.type);
+        PLUGIN_DEBUG_LOG("Delta KV Output mode: using input buffer for kernel, will copy delta to output");
+    }
+    else
+    {
+        // Standard mode: use output buffer directly
+        kvCacheTensor = rt::Tensor(
+            kvCacheOutputPtr, rt::Coords{kvCacheInputDesc.dims}, rt::DeviceType::kGPU, kvCacheInputDesc.type);
+    }
 
     // Extract KV cache capacity from the runtime tensor shape.
     int32_t const kvCacheCapacity = static_cast<int32_t>(kvCacheInputDesc.dims.d[3]);
@@ -588,6 +658,29 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
         // Dispatch FMHA kernel
         fmhaRunner.dispatchFMHAKernel(params, stream);
+
+        // Delta KV Output: Copy the newly computed KV to output buffer
+        if (mEnableDeltaKVOutput)
+        {
+            // For Context/Prefill phase, copy [0 : runtimeSeqLen] for each batch/head
+            // Layout: [B, 2, H, Capacity, D] -> [B, 2, H, SeqLen, D]
+            size_t widthInBytes = static_cast<size_t>(runtimeSeqLen) * mHeadSize * sizeof(half);
+            size_t height = static_cast<size_t>(runtimeBatchSize) * 2 * mNumKVHeads;
+            size_t srcPitch = static_cast<size_t>(kvCacheCapacity) * mHeadSize * sizeof(half);
+            size_t dstPitch = widthInBytes;
+
+            cudaError_t status = cudaMemcpy2DAsync(kvCacheOutputPtr, dstPitch, kvCacheInputPtr, srcPitch, widthInBytes,
+                height, cudaMemcpyDeviceToDevice, stream);
+
+            if (status != cudaSuccess)
+            {
+                LOG_ERROR("Delta KV copy failed in Context Phase: %s", cudaGetErrorString(status));
+            }
+            else
+            {
+                PLUGIN_DEBUG_LOG("Delta KV copied in Context Phase (2D Copy, SeqLen=%d)", runtimeSeqLen);
+            }
+        }
     }
     else
     {
@@ -623,13 +716,23 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             // Execute vanilla decoding.
             xqaRunner.dispatchXQAKernel(params, stream);
         }
+
+        // Delta KV Output: Copy the newly computed KV token to output buffer
+        if (mEnableDeltaKVOutput)
+        {
+            // For Generation phase, copy only the last updated token (at seq_len - 1)
+            kernel::copyDeltaKV(kvCacheInputPtr, kvCacheOutputPtr, contextLengthTensor.dataPointer<int32_t>(),
+                runtimeBatchSize, mNumKVHeads, kvCacheCapacity, mHeadSize, stream);
+            PLUGIN_DEBUG_LOG("Delta KV kernel dispatched for Generation Phase");
+        }
     }
     return 0;
 }
 
 size_t AttentionPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mNumQHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mEnableTreeAttention);
+    return sizeof(mNumQHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mEnableTreeAttention)
+        + sizeof(mEnableDeltaKVOutput);
 }
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
@@ -638,6 +741,7 @@ void AttentionPlugin::serialize(void* buffer) const noexcept
     serializeValue(&buffer, mNumKVHeads);
     serializeValue(&buffer, mHeadSize);
     serializeValue(&buffer, mEnableTreeAttention);
+    serializeValue(&buffer, mEnableDeltaKVOutput);
 }
 
 int32_t AttentionPlugin::initialize() noexcept
@@ -662,6 +766,8 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("enable_tree_attention", nullptr, PluginFieldType::kINT32, 0));
+    // Delta KV Output mode for Python/torch_tensorrt compatibility (default: disabled)
+    mPluginAttributes.emplace_back(PluginField("enable_delta_kv_output", nullptr, PluginFieldType::kINT32, 0));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
 }
@@ -700,6 +806,9 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
         std::optional<int32_t> numKVHeads = parsePluginScalarField<int32_t>("num_kv_heads", fc);
         std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
         std::optional<int32_t> enableTreeAttention = parsePluginScalarField<int32_t>("enable_tree_attention", fc);
+        // Optional: Delta KV Output mode for Python/torch_tensorrt compatibility
+        std::optional<int32_t> enableDeltaKVOutput = parsePluginScalarField<int32_t>("enable_delta_kv_output", fc);
+        int32_t enableDeltaKVOutputValue = enableDeltaKVOutput.value_or(0);
 
         // Enforce Core parameters are specified.
         bool checkRequiredFields = numQHeads.has_value() && headSize.has_value() && numKVHeads.has_value()
@@ -710,8 +819,8 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
             return nullptr;
         }
 
-        AttentionPlugin* plugin = new AttentionPlugin(
-            std::string(name), numQHeads.value(), numKVHeads.value(), headSize.value(), enableTreeAttention.value());
+        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(),
+            headSize.value(), enableTreeAttention.value(), enableDeltaKVOutputValue);
 
         return plugin;
     }

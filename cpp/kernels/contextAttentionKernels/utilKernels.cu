@@ -148,5 +148,59 @@ void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, cudaStream_t 
         <<<grid, block, 0, stream>>>(src.dataPointer<half>(), dst.dataPointer<half>(), B, S, H, D);
 }
 
+// ===== kernel: copy delta KV (single token at seq_len - 1) for Generation Phase =====
+__global__ void copyDeltaKVKernel(half const* __restrict__ src, half* __restrict__ dst, int32_t const* seqLens,
+    int32_t H, int32_t Capacity, int32_t D)
+{
+    // Copy the slice at [seq_len - 1] from src to dst.
+    // src: [B, 2, H, Capacity, D]
+    // dst: [B, 2, H, 1, D]
+    //
+    // Grid: (H, 2, B) - one block per (head, k/v, batch)
+    // Block: D elements (or loop if D > blockDim.x)
+
+    int const b = blockIdx.z;
+    int const kv = blockIdx.y;
+    int const h = blockIdx.x;
+
+    int const d = threadIdx.x;
+    if (d >= D)
+        return;
+
+    // Determine seq_len for this batch
+    int const seqLen = seqLens[b];
+    if (seqLen <= 0)
+        return;
+
+    // Source index: [b, kv, h, seq_len-1, d]
+    // Layout: [B, 2, H, Capacity, D]
+    // Flat index: ((((b * 2 + kv) * H + h) * Capacity + (seqLen - 1)) * D + d)
+    int64_t const srcIdx = ((((static_cast<int64_t>(b) * 2 + kv) * H + h) * Capacity + (seqLen - 1)) * D + d);
+
+    // Destination index: [b, kv, h, 0, d]
+    // Layout: [B, 2, H, 1, D]
+    // Flat index: ((((b * 2 + kv) * H + h) * 1 + 0) * D + d)
+    int64_t const dstIdx = ((((static_cast<int64_t>(b) * 2 + kv) * H + h) * 1 + 0) * D + d);
+
+    dst[dstIdx] = src[srcIdx];
+}
+
+void copyDeltaKV(half const* kvInput, half* kvDeltaOutput, int32_t const* seqLens, int32_t B, int32_t H,
+    int32_t Capacity, int32_t D, cudaStream_t stream)
+{
+    // Grid: (H, 2, B) - covers all heads, K/V, and batches
+    dim3 grid(H, 2, B);
+
+    // Block: D threads (round up to warp size for efficiency)
+    // Head size is typically 64 or 128, so this fits in a single block
+    int blockSize = (D + 31) / 32 * 32;
+    if (blockSize > 1024)
+    {
+        blockSize = 1024;
+    }
+
+    copyDeltaKVKernel<<<grid, blockSize, 0, stream>>>(kvInput, kvDeltaOutput, seqLens, H, Capacity, D);
+}
+
 } // namespace kernel
 } // namespace trt_edgellm

@@ -59,5 +59,21 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
 //! \param[in] stream CUDA stream to launch the kernel on
 void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, cudaStream_t stream);
 
+//! \brief Copies the last updated KV element (at seq_len - 1) from Input KV to Output Delta KV.
+//!
+//! This kernel is used for Delta KV Output mode in Generation Phase when returning only the
+//! newly computed KV token to Python/torch_tensorrt runtime.
+//!
+//! \param[in]  kvInput       Input KV cache with shape [B, 2, H, Capacity, D]
+//! \param[out] kvDeltaOutput Output delta KV with shape [B, 2, H, 1, D]
+//! \param[in]  seqLens       Sequence lengths per batch [B] (total length including new token)
+//! \param[in]  B             Batch size
+//! \param[in]  H             Number of KV heads
+//! \param[in]  Capacity      KV cache capacity
+//! \param[in]  D             Head dimension
+//! \param[in]  stream        CUDA stream to launch the kernel on
+void copyDeltaKV(half const* kvInput, half* kvDeltaOutput, int32_t const* seqLens, int32_t B, int32_t H,
+    int32_t Capacity, int32_t D, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm
