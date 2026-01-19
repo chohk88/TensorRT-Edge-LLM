@@ -90,20 +90,21 @@ void applyThorSMRenumberWAR(int32_t& smVersion)
 }
 
 // Define the mapping of input and output indices of the AttentionPlugin.
+// Note: kv_cache_start_idx is now OPTIONAL (like in the legacy tensorrt-edgellm version)
+// to maintain backward compatibility with Python/torch_tensorrt integration.
 constexpr int32_t kIN_QKV_IDX{0};
 constexpr int32_t kIN_KV_CACHE_IDX{1};
 constexpr int32_t kIN_CONTEXT_LENGTH_IDX{2};
 constexpr int32_t kIN_ROPE_COS_SIN_IDX{3};
-constexpr int32_t kIN_KV_CACHE_START_IDX{4};
-constexpr int32_t kIN_OPTIONAL_ATTN_MASK_IDX{5};
-constexpr int32_t kIN_OPTIONAL_ATTN_POS_ID_IDX{6};
+// kv_cache_start_idx position is dynamic (4 or not present)
 constexpr int32_t kOUT_ATTENTION_IDX{0};
 constexpr int32_t kOUT_KV_CACHE_IDX{1};
 
 // Reflect the count of Inputs and Outputs of the AttentionPlugin,
 // these definitions shall be consistent.
-constexpr int32_t kNUM_REQUIRED_INPUTS{5};
-constexpr int32_t kNUM_OPTIONAL_INPUTS{2};
+// Changed from 5 to 4: kv_cache_start_idx is now optional for backward compatibility
+constexpr int32_t kNUM_BASE_REQUIRED_INPUTS{4};  // QKV, KV, ctx_len, rope
+constexpr int32_t kNUM_OPTIONAL_TREE_ATTN_INPUTS{2};  // attn_mask, attn_pos_id
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
 
 // Support Tree Attention decoding schema up to 128 tokens in the draft tree per batch.
@@ -121,16 +122,25 @@ enum class AttentionExecutionMode
 
 AttentionExecutionMode deduceModeVanilla(rt::Tensor const& qkvInputTensor, rt::Tensor const& kvCacheStartIdxTensor)
 {
-    // Empty KVCache Start indices means normal prefill without previous KVCache. Notice single token is also a valid
-    // prefill length.
+    int64_t const runtimeSeqLen = qkvInputTensor.getShape()[1];
+    
+    // If kvCacheStartIdxTensor is empty (not provided or empty batch), use runtimeSeqLen to determine mode.
+    // This provides backward compatibility with the legacy 4-input mode from tensorrt-edgellm.
     if (kvCacheStartIdxTensor.getShape()[0] == 0)
     {
+        // Use sequence length to distinguish: >1 is context (prefill), ==1 is generation (decode)
+        if (runtimeSeqLen > 1)
+    {
         return AttentionExecutionMode::kNORMAL_PREFILL;
+        }
+        else
+        {
+            return AttentionExecutionMode::kVANILLA_DECODING;
+        }
     }
 
     // Otherwise, distinguish between chunked prefill and vanilla decoding based on the runtime Sequence Length.
     // Vanilla decoding should always have runtime sequence length of 1.
-    int64_t const runtimeSeqLen = qkvInputTensor.getShape()[1];
     if (runtimeSeqLen > 1)
     {
         return AttentionExecutionMode::kCHUNKED_PREFILL;
@@ -361,33 +371,44 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    int32_t const expectedNbInputs
-        = mEnableTreeAttention ? kNUM_REQUIRED_INPUTS + kNUM_OPTIONAL_INPUTS : kNUM_REQUIRED_INPUTS;
-    bool const checkNumIOs = nbInputs == expectedNbInputs && nbOutputs == kNUM_REQUIRED_OUTPUTS;
+    // Flexible input count: support both 4 inputs (legacy) and 5+ inputs (with kv_cache_start_idx)
+    // Base: 4 required inputs (QKV, KV, ctx_len, rope)
+    // Optional: kv_cache_start_idx (1) + tree attention inputs (2)
+    int32_t const minExpectedInputs = kNUM_BASE_REQUIRED_INPUTS;  // 4
+    int32_t const maxExpectedInputs = kNUM_BASE_REQUIRED_INPUTS + 1 + kNUM_OPTIONAL_TREE_ATTN_INPUTS;  // 7
+    
+    bool const checkNumIOs = (nbInputs >= minExpectedInputs && nbInputs <= maxExpectedInputs) 
+                             && nbOutputs == kNUM_REQUIRED_OUTPUTS;
     if (!checkNumIOs)
     {
         LOG_ERROR(
-            "Invalid number of inputs or outputs for the AttentionPlugin '%s'. Expected %d inputs and %d outputs, but "
+            "Invalid number of inputs or outputs for the AttentionPlugin '%s'. Expected %d-%d inputs and %d outputs, but "
             "got %d inputs and %d outputs.",
-            mLayerName.c_str(), expectedNbInputs, kNUM_REQUIRED_OUTPUTS, nbInputs, nbOutputs);
+            mLayerName.c_str(), minExpectedInputs, maxExpectedInputs, kNUM_REQUIRED_OUTPUTS, nbInputs, nbOutputs);
         return false;
     }
+
+    // Determine which optional inputs are present based on nbInputs
+    // 4 inputs: base only (QKV, KV, ctx_len, rope)
+    // 5 inputs: base + kv_cache_start_idx
+    // 6 inputs: base + kv_cache_start_idx + attn_mask (tree attention)
+    // 7 inputs: base + kv_cache_start_idx + attn_mask + attn_pos_id (tree attention)
+    bool const hasKVCacheStartIdx = (nbInputs >= 5);
+    bool const hasTreeAttention = (nbInputs >= 6);
 
     bool result{true};
 
     if (pos < nbInputs)
     {
-        switch (pos)
-        {
-        case kIN_QKV_IDX: result = checkGemmQKV(inOut[0]); break;
-        case kIN_KV_CACHE_IDX: result = checkKVCache(inOut[1]); break;
-        case kIN_CONTEXT_LENGTH_IDX: result = checkSequenceLen(inOut[2]); break;
-        case kIN_ROPE_COS_SIN_IDX: result = checkPosEncodingCosSin(inOut[3]); break;
-        case kIN_KV_CACHE_START_IDX: result = checkKVCacheStartIdx(inOut[4]); break;
-        case kIN_OPTIONAL_ATTN_MASK_IDX: result = checkAttentionMask(inOut[5]); break;
-        case kIN_OPTIONAL_ATTN_POS_ID_IDX: result = checkAttentionPosId(inOut[6]); break;
-        default: break;
-        }
+        // Check base required inputs (positions 0-3)
+        if (pos == kIN_QKV_IDX) { result = checkGemmQKV(inOut[0]); }
+        else if (pos == kIN_KV_CACHE_IDX) { result = checkKVCache(inOut[1]); }
+        else if (pos == kIN_CONTEXT_LENGTH_IDX) { result = checkSequenceLen(inOut[2]); }
+        else if (pos == kIN_ROPE_COS_SIN_IDX) { result = checkPosEncodingCosSin(inOut[3]); }
+        // Check optional inputs (positions 4+)
+        else if (pos == 4 && hasKVCacheStartIdx) { result = checkKVCacheStartIdx(inOut[4]); }
+        else if (pos == 5 && hasTreeAttention) { result = checkAttentionMask(inOut[5]); }
+        else if (pos == 6 && hasTreeAttention) { result = checkAttentionPosId(inOut[6]); }
     }
     else
     {
@@ -441,7 +462,7 @@ DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::Di
         else
         {
             // Standard mode: output full KV cache (same shape as input)
-            output.d[3] = inputs[1].d[3];
+        output.d[3] = inputs[1].d[3];
         }
         output.d[4] = inputs[1].d[4];
     }
@@ -452,7 +473,9 @@ void AttentionPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTe
     [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out,
     [[maybe_unused]] int32_t nbOutputs) noexcept
 {
-    return; // No need to configure anything since we will only use the runtime tensor shapes.
+    // Store the number of inputs for use in enqueue() to determine optional inputs
+    mNbInputs = nbInputs;
+    LOG_DEBUG("AttentionPlugin configured with %d inputs", nbInputs);
 }
 
 // TODO: extend the workspace calculation to a more generalized form.
@@ -529,9 +552,17 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     rt::Tensor const ropeCosSinTensor(const_cast<void*>(inputs[kIN_ROPE_COS_SIN_IDX]),
         rt::Coords{posEncodingCosSinDesc.dims}, rt::DeviceType::kGPU, posEncodingCosSinDesc.type);
 
+    // kv_cache_start_idx is optional (5th input, index 4) for backward compatibility
+    // If only 4 inputs are provided, create an empty tensor
+    constexpr int32_t kIN_KV_CACHE_START_IDX = 4;
+    bool const hasKVCacheStartIdx = (mNbInputs >= 5);
+    rt::Tensor kvCacheStartIdxTensor{};
+    if (hasKVCacheStartIdx)
+    {
     PluginTensorDesc const& kvCacheStartIdxInputDesc = inputDesc[kIN_KV_CACHE_START_IDX];
-    rt::Tensor const kvCacheStartIdxTensor(const_cast<void*>(inputs[kIN_KV_CACHE_START_IDX]),
+        kvCacheStartIdxTensor = rt::Tensor(const_cast<void*>(inputs[kIN_KV_CACHE_START_IDX]),
         rt::Coords{kvCacheStartIdxInputDesc.dims}, rt::DeviceType::kGPU, kvCacheStartIdxInputDesc.type);
+    }
 
     PluginTensorDesc const& attentionOutputDesc = outputDesc[kOUT_ATTENTION_IDX];
     rt::Tensor attentionOutputTensor(outputs[kOUT_ATTENTION_IDX], rt::Coords{attentionOutputDesc.dims},
@@ -565,16 +596,21 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     // Extract KV cache capacity from the runtime tensor shape.
     int32_t const kvCacheCapacity = static_cast<int32_t>(kvCacheInputDesc.dims.d[3]);
 
-    // Optional Inputs that are not used with Tree Attention enabled.
+    // Optional Inputs for Tree Attention.
+    // Indices depend on whether kv_cache_start_idx is present:
+    // - With kv_cache_start_idx (5+ inputs): attn_mask at 5, attn_pos_id at 6
+    // - Without kv_cache_start_idx (4 inputs + tree): attn_mask at 4, attn_pos_id at 5
     rt::Tensor attentionMaskTensor{};
     rt::Tensor attentionPosIdTensor{};
     if (mEnableTreeAttention)
     {
-        PluginTensorDesc const& attentionMaskInputDesc = inputDesc[kIN_OPTIONAL_ATTN_MASK_IDX];
-        PluginTensorDesc const& attentionPosIdInputDesc = inputDesc[kIN_OPTIONAL_ATTN_POS_ID_IDX];
-        attentionMaskTensor = rt::Tensor(const_cast<void*>(inputs[kIN_OPTIONAL_ATTN_MASK_IDX]),
+        int32_t const attnMaskIdx = hasKVCacheStartIdx ? 5 : 4;
+        int32_t const attnPosIdIdx = hasKVCacheStartIdx ? 6 : 5;
+        PluginTensorDesc const& attentionMaskInputDesc = inputDesc[attnMaskIdx];
+        PluginTensorDesc const& attentionPosIdInputDesc = inputDesc[attnPosIdIdx];
+        attentionMaskTensor = rt::Tensor(const_cast<void*>(inputs[attnMaskIdx]),
             rt::Coords{attentionMaskInputDesc.dims}, rt::DeviceType::kGPU, attentionMaskInputDesc.type);
-        attentionPosIdTensor = rt::Tensor(const_cast<void*>(inputs[kIN_OPTIONAL_ATTN_POS_ID_IDX]),
+        attentionPosIdTensor = rt::Tensor(const_cast<void*>(inputs[attnPosIdIdx]),
             rt::Coords{attentionPosIdInputDesc.dims}, rt::DeviceType::kGPU, attentionPosIdInputDesc.type);
     }
 
