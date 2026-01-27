@@ -23,3 +23,14 @@ target_include_directories(
   llm_inference PRIVATE ${COMMON_INCLUDE_DIRS}
                         ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(llm_inference)
+
+# Torch-TensorRT inference example
+# This executable runs LLM inference using engines built with torch_tensorrt
+# (e.g., from torch-tensorrt's run_llm.py with --backend plugin)
+add_executable(torch_trt_inference torch_trt_inference.cpp)
+target_link_libraries(torch_trt_inference PRIVATE edgellmCore edgellmTokenizer
+                                                  exampleUtils commonLibraryExt)
+target_include_directories(
+  torch_trt_inference PRIVATE ${COMMON_INCLUDE_DIRS}
+                              ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(torch_trt_inference)
