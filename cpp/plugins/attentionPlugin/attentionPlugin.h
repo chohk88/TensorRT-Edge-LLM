@@ -188,6 +188,8 @@ protected:
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
     int32_t mSMVersion; //!< CUDA SM version
+    //! Number of inputs configured by configurePlugin (used to detect optional inputs)
+    int32_t mNbInputs{4};
 };
 
 //! \brief Factory class for creating AttentionPlugin instances
